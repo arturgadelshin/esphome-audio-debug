@@ -349,13 +349,39 @@ def apply_spectral_subtraction(samples: np.ndarray, noise_frames: int = 5, fs: i
     return reconstructed[:len(samples)]
 
 
-def apply_normalize(samples: np.ndarray, target_db: float = -3) -> np.ndarray:
+def apply_normalize(samples: np.ndarray, target_db: float = -6) -> np.ndarray:
     peak = np.max(np.abs(samples))
     if peak == 0:
         return samples
     target = 32768 * (10 ** (target_db / 20))
     gain = target / peak
     return samples * gain
+
+
+def apply_limiter(samples: np.ndarray, ceiling_db: float = -1) -> np.ndarray:
+    ceiling = 32768 * (10 ** (ceiling_db / 20))
+    out = np.copy(samples)
+    over = np.abs(out) > ceiling
+    out[over] = np.sign(out[over]) * ceiling
+    return out
+
+
+def apply_compressor(samples: np.ndarray, threshold_db: float = -20, ratio: float = 4.0, fs: int = 16000) -> np.ndarray:
+    out = np.copy(samples)
+    frame_len = int(fs * 0.01)
+    for i in range(0, len(samples), frame_len):
+        e = min(i + frame_len, len(samples))
+        frame = out[i:e]
+        rms = np.sqrt(np.mean(frame ** 2))
+        if rms < 1:
+            continue
+        rms_db = 20 * np.log10(rms / 32768)
+        if rms_db > threshold_db:
+            over = rms_db - threshold_db
+            new_db = threshold_db + over / ratio
+            gain = 10 ** ((new_db - rms_db) / 20)
+            out[i:e] = frame * gain
+    return out
 
 
 def apply_agc(samples: np.ndarray, frame_ms: float = 20, target_rms_db: float = -20, fs: int = 16000) -> np.ndarray:
@@ -375,35 +401,56 @@ def apply_agc(samples: np.ndarray, frame_ms: float = 20, target_rms_db: float = 
 
 
 FILTERS = {
-    "highpass_150": lambda s: apply_highpass(s, 150),
-    "highpass_300": lambda s: apply_highpass(s, 300),
-    "lowpass_4000": lambda s: apply_lowpass(s, 4000),
-    "noise_gate": lambda s: apply_noise_gate(s, -40),
-    "spectral_subtraction": lambda s: apply_spectral_subtraction(s),
-    "normalize": lambda s: apply_normalize(s, -3),
-    "agc": lambda s: apply_agc(s),
+    "highpass": apply_highpass,
+    "lowpass": apply_lowpass,
+    "noise_gate": apply_noise_gate,
+    "spectral_subtraction": apply_spectral_subtraction,
+    "normalize": apply_normalize,
+    "limiter": apply_limiter,
+    "compressor": apply_compressor,
+    "agc": apply_agc,
 }
+
+FILTER_DEFAULTS = {
+    "highpass": {"cutoff": 150},
+    "lowpass": {"cutoff": 4000},
+    "noise_gate": {"threshold_db": -40},
+    "spectral_subtraction": {"noise_frames": 5},
+    "normalize": {"target_db": -6},
+    "limiter": {"ceiling_db": -1},
+    "compressor": {"threshold_db": -20, "ratio": 4.0},
+    "agc": {"frame_ms": 20, "target_rms_db": -20},
+}
+
+
+def apply_filter_chain(samples: np.ndarray, steps: list) -> np.ndarray:
+    for step in steps:
+        fname = step.get("filter") if isinstance(step, dict) else step
+        params = step.get("params", {}) if isinstance(step, dict) else {}
+        if fname not in FILTERS:
+            raise HTTPException(400, f"Unknown filter: {fname}")
+        defaults = FILTER_DEFAULTS.get(fname, {})
+        kwargs = {**defaults, **params}
+        samples = FILTERS[fname](samples, **kwargs)
+    return samples
 
 
 @app.post("/api/recordings/{rec_id}/filter")
 async def api_filter(rec_id: str, body: dict = None):
     body = body or {}
     filter_names = body.get("filters", [])
-    chain = body.get("chain", None)
+    chain = body.get("chain", [])
+
+    steps = []
+    for fname in filter_names:
+        steps.append({"filter": fname})
+    steps.extend(chain)
+
+    if not steps:
+        raise HTTPException(400, "No filters specified")
 
     samples = load_pcm(rec_id)
-
-    if chain:
-        for step in chain:
-            fname = step.get("filter")
-            if fname not in FILTERS:
-                raise HTTPException(400, f"Unknown filter: {fname}")
-            samples = FILTERS[fname](samples)
-    else:
-        for fname in filter_names:
-            if fname not in FILTERS:
-                raise HTTPException(400, f"Unknown filter: {fname}")
-            samples = FILTERS[fname](samples)
+    samples = apply_filter_chain(samples, steps)
 
     raw = pcm_to_bytes(samples)
     metrics = compute_metrics(raw)
@@ -421,13 +468,24 @@ async def api_filter(rec_id: str, body: dict = None):
 @app.get("/api/filters")
 async def api_list_filters():
     return JSONResponse([
-        {"id": "highpass_150", "name": "High-pass 150Hz", "desc": "Убирает низкочастотный гул"},
-        {"id": "highpass_300", "name": "High-pass 300Hz", "desc": "Агрессивнее, убирает басы"},
-        {"id": "lowpass_4000", "name": "Low-pass 4kHz", "desc": "Оставляет только голос (0-4kHz)"},
-        {"id": "noise_gate", "name": "Noise Gate -40dB", "desc": "Обрезает тихие участки"},
-        {"id": "spectral_subtraction", "name": "Spectral Subtraction", "desc": "Вычитает шум по спектру"},
-        {"id": "normalize", "name": "Normalize -3dB", "desc": "Нормализация громкости"},
-        {"id": "agc", "name": "AGC", "desc": "Автоматическая регулировка усиления"},
+        {"id": "highpass", "name": "High-pass", "desc": "Убирает низкочастотный гул",
+         "params": {"cutoff": {"type": "int", "default": 150, "label": "Cutoff Hz", "min": 20, "max": 8000}}},
+        {"id": "lowpass", "name": "Low-pass", "desc": "Оставляет только частоты ниже cutoff",
+         "params": {"cutoff": {"type": "int", "default": 4000, "label": "Cutoff Hz", "min": 500, "max": 15999}}},
+        {"id": "noise_gate", "name": "Noise Gate", "desc": "Обрезает тихие участки",
+         "params": {"threshold_db": {"type": "float", "default": -40, "label": "Threshold dB", "min": -80, "max": 0}}},
+        {"id": "spectral_subtraction", "name": "Spectral Subtraction", "desc": "Вычитает шум по спектру",
+         "params": {"noise_frames": {"type": "int", "default": 5, "label": "Noise frames", "min": 1, "max": 50}}},
+        {"id": "normalize", "name": "Normalize", "desc": "Нормализация громкости (peak)",
+         "params": {"target_db": {"type": "float", "default": -6, "label": "Target dB", "min": -40, "max": 0}}},
+        {"id": "limiter", "name": "Limiter", "desc": "Жёсткое ограничение пиков",
+         "params": {"ceiling_db": {"type": "float", "default": -1, "label": "Ceiling dB", "min": -20, "max": 0}}},
+        {"id": "compressor", "name": "Compressor", "desc": "Сжатие динамического диапазона",
+         "params": {"threshold_db": {"type": "float", "default": -20, "label": "Threshold dB", "min": -60, "max": 0},
+                    "ratio": {"type": "float", "default": 4.0, "label": "Ratio", "min": 1, "max": 20}}},
+        {"id": "agc", "name": "AGC", "desc": "Автоматическая регулировка усиления",
+         "params": {"target_rms_db": {"type": "float", "default": -20, "label": "Target RMS dB", "min": -40, "max": 0},
+                    "frame_ms": {"type": "float", "default": 20, "label": "Frame ms", "min": 5, "max": 100}}},
     ])
 
 

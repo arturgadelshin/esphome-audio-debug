@@ -134,19 +134,18 @@ canvas{width:100%;height:200px;border-radius:8px;background:#0f172a;cursor:cross
   <!-- DSP Filters -->
   <div class="panel full">
     <h2>DSP Filters — <span id="filterRecTitle">select recording</span></h2>
-    <div class="controls" style="margin-bottom:12px">
-      <button class="btn-ghost" onclick="applyFilter('highpass_150')">High-pass 150Hz</button>
-      <button class="btn-ghost" onclick="applyFilter('highpass_300')">High-pass 300Hz</button>
-      <button class="btn-ghost" onclick="applyFilter('lowpass_4000')">Low-pass 4kHz</button>
-      <button class="btn-ghost" onclick="applyFilter('noise_gate')">Noise Gate</button>
-      <button class="btn-ghost" onclick="applyFilter('spectral_subtraction')">Spectral Sub</button>
-      <button class="btn-ghost" onclick="applyFilter('normalize')">Normalize</button>
-      <button class="btn-ghost" onclick="applyFilter('agc')">AGC</button>
-      <button class="btn-primary" onclick="applyChain()">Apply Chain</button>
+    <div id="filterButtons" style="margin-bottom:12px"><span class="empty">Loading filters...</span></div>
+    <div id="filterParamsPanel" style="margin-bottom:12px;display:none;background:#0f172a;border-radius:8px;padding:12px;border:1px solid #334155">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+        <span style="color:#38bdf8;font-weight:600" id="paramFilterName"></span>
+        <button class="btn-primary" style="padding:6px 16px;font-size:13px" onclick="applySelectedFilter()">Apply</button>
+      </div>
+      <div id="paramInputs" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px"></div>
     </div>
     <div style="margin-bottom:12px;display:flex;gap:8px;align-items:center;font-size:13px;color:#64748b">
       <span>Chain:</span>
-      <input id="filterChainInput" type="text" value="highpass_150,spectral_subtraction,normalize" style="flex:1;padding:6px 10px;background:#0f172a;border:1px solid #334155;border-radius:6px;color:#e2e8f0;font-size:13px">
+      <input id="filterChainInput" type="text" value="highpass:cutoff=150,spectral_subtraction:noise_frames=5,normalize:target_db=-6" style="flex:1;padding:6px 10px;background:#0f172a;border:1px solid #334155;border-radius:6px;color:#e2e8f0;font-size:13px">
+      <button class="btn-primary" style="padding:6px 16px;font-size:13px" onclick="applyChain()">Apply Chain</button>
       <span id="filterStatus"></span>
     </div>
     <div class="compare-container" id="filterCompare">
@@ -500,28 +499,85 @@ function drawMiniWave(canvasId, samples) {
 
 let origMetrics = null;
 let lastFilteredAudio = null;
+let filterDefs = [];
+let selectedFilterId = null;
 
-async function applyFilter(filterName) {
+async function loadFilters() {
+  filterDefs = await api('GET', '/api/filters');
+  const el = document.getElementById('filterButtons');
+  el.innerHTML = '<div class="controls">' + filterDefs.map(f =>
+    `<button class="btn-ghost" onclick="selectFilter('${f.id}')" title="${f.desc}">${f.name}</button>`
+  ).join('') + '</div>';
+}
+
+function selectFilter(id) {
+  selectedFilterId = id;
+  const f = filterDefs.find(x => x.id === id);
+  if (!f) return;
+  document.getElementById('paramFilterName').textContent = f.name + ' — ' + f.desc;
+  const panel = document.getElementById('filterParamsPanel');
+  panel.style.display = 'block';
+  const inputs = document.getElementById('paramInputs');
+  inputs.innerHTML = Object.entries(f.params).map(([key, p]) =>
+    `<div><label style="font-size:11px;color:#64748b;display:block;margin-bottom:2px">${p.label} (${key})</label>` +
+    `<input id="param_${key}" type="number" value="${p.default}" min="${p.min}" max="${p.max}" step="${p.type==='float'?'0.1':'1'}" ` +
+    `style="width:100%;padding:6px 8px;background:#1e293b;border:1px solid #334155;border-radius:4px;color:#e2e8f0;font-size:13px"></div>`
+  ).join('');
+}
+
+function getFilterParams() {
+  const f = filterDefs.find(x => x.id === selectedFilterId);
+  if (!f) return {};
+  const params = {};
+  for (const [key, p] of Object.entries(f.params)) {
+    const el = document.getElementById('param_' + key);
+    params[key] = el ? parseFloat(el.value) : p.default;
+  }
+  return params;
+}
+
+async function applySelectedFilter() {
   if (!selected) { alert('Select a recording first'); return; }
+  if (!selectedFilterId) return;
   document.getElementById('filterStatus').textContent = 'Processing...';
   try {
-    const res = await api('POST', `/api/recordings/${selected}/filter`, { filters: [filterName] });
+    const params = getFilterParams();
+    const res = await api('POST', `/api/recordings/${selected}/filter`, {
+      chain: [{"filter": selectedFilterId, "params": params}]
+    });
     lastFilteredAudio = res.audio_b64;
-    showFilterResult(filterName, res);
+    const label = selectedFilterId + '(' + Object.entries(params).map(([k,v])=>k+'='+v).join(', ') + ')';
+    showFilterResult(label, res);
   } catch(e) { document.getElementById('filterStatus').textContent = 'Error: ' + e; }
 }
 
 async function applyChain() {
   if (!selected) { alert('Select a recording first'); return; }
   const chainStr = document.getElementById('filterChainInput').value;
-  const filters = chainStr.split(',').map(s => s.trim()).filter(Boolean);
-  if (!filters.length) return;
+  const chain = parseChain(chainStr);
+  if (!chain.length) return;
   document.getElementById('filterStatus').textContent = 'Processing chain...';
   try {
-    const res = await api('POST', `/api/recordings/${selected}/filter`, { filters });
+    const res = await api('POST', `/api/recordings/${selected}/filter`, { chain });
     lastFilteredAudio = res.audio_b64;
-    showFilterResult(filters.join(' → '), res);
+    showFilterResult(chainStr, res);
   } catch(e) { document.getElementById('filterStatus').textContent = 'Error: ' + e; }
+}
+
+function parseChain(str) {
+  return str.split(',').map(s => {
+    s = s.trim();
+    const parts = s.split(':');
+    const fname = parts[0];
+    const params = {};
+    if (parts.length > 1) {
+      parts.slice(1).forEach(p => {
+        const [k, v] = p.split('=');
+        if (k && v !== undefined) params[k.trim()] = parseFloat(v);
+      });
+    }
+    return {"filter": fname, "params": params};
+  });
 }
 
 function playFiltered() {
@@ -623,6 +679,7 @@ function drawSpectrogramOn(canvasId, spec) {
   }
 }
 
+loadFilters();
 loadRecordings();
 </script>
 </body>
