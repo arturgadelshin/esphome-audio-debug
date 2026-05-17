@@ -46,7 +46,10 @@ button:disabled{opacity:.4;cursor:not-allowed}
 .metric-card{background:#0f172a;border-radius:8px;padding:12px;text-align:center}
 .metric-val{font-size:22px;font-weight:700;color:#38bdf8}
 .metric-label{font-size:11px;color:#64748b;margin-top:4px;text-transform:uppercase}
-canvas{width:100%;height:200px;border-radius:8px;background:#0f172a}
+canvas{width:100%;height:200px;border-radius:8px;background:#0f172a;cursor:crosshair}
+.wave-controls{display:flex;gap:8px;align-items:center;margin-bottom:8px;font-size:12px;color:#64748b}
+.wave-controls button{padding:4px 10px;font-size:12px}
+.wave-controls span{min-width:120px}
 .compare-container{display:grid;grid-template-columns:1fr 1fr;gap:12px}
 @media(max-width:900px){.compare-container{grid-template-columns:1fr}}
 .compare-item{background:#0f172a;border-radius:8px;padding:8px}
@@ -106,6 +109,12 @@ canvas{width:100%;height:200px;border-radius:8px;background:#0f172a}
   <!-- Waveform -->
   <div class="panel full">
     <h2>Waveform — <span id="waveTitle">select recording</span></h2>
+    <div class="wave-controls">
+      <button class="btn-ghost" onclick="waveZoom(1.5)">Zoom In</button>
+      <button class="btn-ghost" onclick="waveZoom(1/1.5)">Zoom Out</button>
+      <button class="btn-ghost" onclick="waveReset()">Reset</button>
+      <span id="waveInfo">Scroll to zoom, drag to pan</span>
+    </div>
     <canvas id="waveCanvas"></canvas>
   </div>
 
@@ -130,6 +139,11 @@ let selected = null;
 let compare = null;
 let isConnected = false;
 let pollTimer = null;
+let waveData = null;
+let waveView = { start: 0, end: 1 };
+let waveDragging = false;
+let waveDragX = 0;
+let waveDragView = null;
 
 async function api(method, path, body) {
   const opts = {method, headers: {'Content-Type': 'application/json'}};
@@ -265,15 +279,46 @@ async function deleteRec(id) {
 
 async function drawWaveform(id) {
   const data = await api('GET', `/api/recordings/${id}/waveform`);
+  waveData = data;
+  waveView = { start: 0, end: 1 };
+  renderWave();
+}
+
+function waveZoom(factor) {
+  if (!waveData) return;
+  const center = (waveView.start + waveView.end) / 2;
+  const range = waveView.end - waveView.start;
+  const newRange = Math.min(1, Math.max(range * (1 / factor), 0.0001));
+  waveView.start = Math.max(0, center - newRange / 2);
+  waveView.end = Math.min(1, waveView.start + newRange);
+  if (waveView.end === 1) waveView.start = 1 - newRange;
+  renderWave();
+}
+
+function waveReset() {
+  waveView = { start: 0, end: 1 };
+  renderWave();
+}
+
+function renderWave() {
+  if (!waveData) return;
   const canvas = document.getElementById('waveCanvas');
   const ctx = canvas.getContext('2d');
   canvas.width = canvas.offsetWidth * 2;
   canvas.height = canvas.offsetHeight * 2;
   ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-  const samples = data.samples;
-  if (!samples || !samples.length) return;
-  const maxVal = Math.max(...samples.map(Math.abs), 1);
+  const all = waveData.samples;
+  if (!all || !all.length) return;
+  const total = waveData.total_samples;
+  const maxVal = Math.max(...all.map(Math.abs), 1);
+
+  const si = Math.floor(waveView.start * total);
+  const ei = Math.floor(waveView.end * total);
+  const startIdx = Math.floor(si / waveData.downsample);
+  const endIdx = Math.ceil(ei / waveData.downsample);
+  const samples = all.slice(startIdx, endIdx);
+  if (!samples.length) return;
 
   ctx.strokeStyle = '#3b82f6';
   ctx.lineWidth = 1.5;
@@ -292,7 +337,53 @@ async function drawWaveform(id) {
   ctx.moveTo(0, canvas.height / 2);
   ctx.lineTo(canvas.width, canvas.height / 2);
   ctx.stroke();
+
+  const dur = waveData.total_samples / 16000;
+  const t0 = (waveView.start * dur).toFixed(2);
+  const t1 = (waveView.end * dur).toFixed(2);
+  document.getElementById('waveInfo').textContent = `${t0}s — ${t1}s (${((waveView.end - waveView.start) * 100).toFixed(1)}%)`;
 }
+
+document.getElementById('waveCanvas').addEventListener('wheel', function(e) {
+  e.preventDefault();
+  const factor = e.deltaY < 0 ? 1.3 : 1 / 1.3;
+  const rect = this.getBoundingClientRect();
+  const mouseX = (e.clientX - rect.left) / rect.width;
+  const range = waveView.end - waveView.start;
+  const newRange = Math.min(1, Math.max(range * (1 / factor), 0.0001));
+  const pivot = waveView.start + mouseX * range;
+  waveView.start = Math.max(0, pivot - mouseX * newRange);
+  waveView.end = Math.min(1, waveView.start + newRange);
+  if (waveView.end === 1) waveView.start = 1 - newRange;
+  renderWave();
+}, { passive: false });
+
+document.getElementById('waveCanvas').addEventListener('mousedown', function(e) {
+  if (!waveData) return;
+  waveDragging = true;
+  waveDragX = e.clientX;
+  waveDragView = { ...waveView };
+  this.style.cursor = 'grabbing';
+});
+
+window.addEventListener('mousemove', function(e) {
+  if (!waveDragging) return;
+  const canvas = document.getElementById('waveCanvas');
+  const rect = canvas.getBoundingClientRect();
+  const dx = (e.clientX - waveDragX) / rect.width;
+  const range = waveDragView.end - waveDragView.start;
+  const shift = -dx * range;
+  waveView.start = Math.max(0, Math.min(1 - range, waveDragView.start + shift));
+  waveView.end = waveView.start + range;
+  renderWave();
+});
+
+window.addEventListener('mouseup', function() {
+  if (waveDragging) {
+    waveDragging = false;
+    document.getElementById('waveCanvas').style.cursor = 'crosshair';
+  }
+});
 
 function drawSpectrogram(spec) {
   const canvas = document.getElementById('specCanvas');
