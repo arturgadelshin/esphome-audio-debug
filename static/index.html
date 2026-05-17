@@ -62,6 +62,13 @@ canvas{width:100%;height:200px;border-radius:8px;background:#0f172a;cursor:cross
 .tag-yellow{background:#854d0e;color:#fde047}
 .capture-info{font-size:13px;color:#64748b;margin-top:8px}
 .capture-info.active{color:#f59e0b}
+.filter-metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(100px,1fr));gap:6px;margin-top:8px}
+.fm-card{background:#0f172a;border-radius:6px;padding:8px;text-align:center}
+.fm-val{font-size:16px;font-weight:700}
+.fm-label{font-size:10px;color:#64748b;text-transform:uppercase}
+.fm-better{color:#22c55e}
+.fm-worse{color:#ef4444}
+.fm-same{color:#94a3b8}
 </style>
 </head>
 <body>
@@ -122,6 +129,29 @@ canvas{width:100%;height:200px;border-radius:8px;background:#0f172a;cursor:cross
   <div class="panel full">
     <h2>Spectrogram — <span id="specTitle">select recording</span></h2>
     <canvas id="specCanvas"></canvas>
+  </div>
+
+  <!-- DSP Filters -->
+  <div class="panel full">
+    <h2>DSP Filters — <span id="filterRecTitle">select recording</span></h2>
+    <div class="controls" style="margin-bottom:12px">
+      <button class="btn-ghost" onclick="applyFilter('highpass_150')">High-pass 150Hz</button>
+      <button class="btn-ghost" onclick="applyFilter('highpass_300')">High-pass 300Hz</button>
+      <button class="btn-ghost" onclick="applyFilter('lowpass_4000')">Low-pass 4kHz</button>
+      <button class="btn-ghost" onclick="applyFilter('noise_gate')">Noise Gate</button>
+      <button class="btn-ghost" onclick="applyFilter('spectral_subtraction')">Spectral Sub</button>
+      <button class="btn-ghost" onclick="applyFilter('normalize')">Normalize</button>
+      <button class="btn-ghost" onclick="applyFilter('agc')">AGC</button>
+      <button class="btn-primary" onclick="applyChain()">Apply Chain</button>
+    </div>
+    <div style="margin-bottom:12px;display:flex;gap:8px;align-items:center;font-size:13px;color:#64748b">
+      <span>Chain:</span>
+      <input id="filterChainInput" type="text" value="highpass_150,spectral_subtraction,normalize" style="flex:1;padding:6px 10px;background:#0f172a;border:1px solid #334155;border-radius:6px;color:#e2e8f0;font-size:13px">
+      <span id="filterStatus"></span>
+    </div>
+    <div class="compare-container" id="filterCompare">
+      <div class="empty">Select a recording and click a filter to compare</div>
+    </div>
   </div>
 
   <!-- Compare -->
@@ -242,6 +272,7 @@ async function selectRecording(id, evt) {
   loadRecordings();
 
   const m = await api('GET', `/api/recordings/${id}/metrics`);
+  origMetrics = m;
   document.getElementById('metricsGrid').innerHTML = `
     <div class="metric-card"><div class="metric-val">${m.duration||0}s</div><div class="metric-label">Duration</div></div>
     <div class="metric-card"><div class="metric-val">${m.rms_db||-96}dB</div><div class="metric-label">RMS</div></div>
@@ -255,12 +286,14 @@ async function selectRecording(id, evt) {
 
   document.getElementById('waveTitle').textContent = id;
   document.getElementById('specTitle').textContent = id + ' (loading...)';
+  document.getElementById('filterRecTitle').textContent = id;
   drawWaveform(id);
   loadSpectrogram(id);
 }
 
 async function loadSpectrogram(id) {
   const spec = await api('GET', `/api/recordings/${id}/spectrogram`);
+  window._origSpec = spec;
   document.getElementById('specTitle').textContent = id;
   drawSpectrogram(spec);
 }
@@ -463,6 +496,119 @@ function drawMiniWave(canvasId, samples) {
     i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
   }
   ctx.stroke();
+}
+
+let origMetrics = null;
+
+async function applyFilter(filterName) {
+  if (!selected) { alert('Select a recording first'); return; }
+  document.getElementById('filterStatus').textContent = 'Processing...';
+  try {
+    const res = await api('POST', `/api/recordings/${selected}/filter`, { filters: [filterName] });
+    showFilterResult(filterName, res);
+  } catch(e) { document.getElementById('filterStatus').textContent = 'Error: ' + e; }
+}
+
+async function applyChain() {
+  if (!selected) { alert('Select a recording first'); return; }
+  const chainStr = document.getElementById('filterChainInput').value;
+  const filters = chainStr.split(',').map(s => s.trim()).filter(Boolean);
+  if (!filters.length) return;
+  document.getElementById('filterStatus').textContent = 'Processing chain...';
+  try {
+    const res = await api('POST', `/api/recordings/${selected}/filter`, { filters });
+    showFilterResult(filters.join(' → '), res);
+  } catch(e) { document.getElementById('filterStatus').textContent = 'Error: ' + e; }
+}
+
+function showFilterResult(label, res) {
+  document.getElementById('filterStatus').textContent = '';
+  document.getElementById('filterRecTitle').textContent = selected + ' → ' + label;
+  const m = res.metrics;
+  const om = origMetrics || {};
+  const cmp = (v, nv, better='better') => {
+    const diff = nv - v;
+    if (Math.abs(diff) < 0.01) return 'fm-same';
+    return (better === 'higher' ? diff > 0 : diff < 0) ? 'fm-better' : 'fm-worse';
+  };
+  document.getElementById('filterCompare').innerHTML = `
+    <div class="compare-item">
+      <h4>Original</h4>
+      <canvas id="filtWaveOrig"></canvas>
+      <canvas id="filtSpecOrig" style="height:150px;margin-top:8px"></canvas>
+      <div class="filter-metrics">
+        <div class="fm-card"><div class="fm-val fm-same">${(om.rms_db||-96).toFixed(1)}dB</div><div class="fm-label">RMS</div></div>
+        <div class="fm-card"><div class="fm-val fm-same">${(om.peak_db||-96).toFixed(1)}dB</div><div class="fm-label">Peak</div></div>
+        <div class="fm-card"><div class="fm-val fm-same">${(om.snr_estimate||0).toFixed(2)}</div><div class="fm-label">SNR</div></div>
+      </div>
+    </div>
+    <div class="compare-item">
+      <h4>Filtered: ${label}</h4>
+      <canvas id="filtWaveNew"></canvas>
+      <canvas id="filtSpecNew" style="height:150px;margin-top:8px"></canvas>
+      <div class="filter-metrics">
+        <div class="fm-card"><div class="fm-val ${cmp(om.rms_db, m.rms_db, 'higher')}">${m.rms_db.toFixed(1)}dB</div><div class="fm-label">RMS</div></div>
+        <div class="fm-card"><div class="fm-val ${cmp(om.peak_db, m.peak_db, 'higher')}">${m.peak_db.toFixed(1)}dB</div><div class="fm-label">Peak</div></div>
+        <div class="fm-card"><div class="fm-val ${cmp(om.snr_estimate, m.snr_estimate, 'higher')}">${m.snr_estimate.toFixed(2)}</div><div class="fm-label">SNR</div></div>
+      </div>
+    </div>
+  `;
+  setTimeout(() => {
+    drawMiniWaveFromData('filtWaveOrig', waveData);
+    drawMiniWaveFromData('filtWaveNew', res.waveform);
+    if (window._origSpec) drawSpectrogramOn('filtSpecOrig', window._origSpec);
+    if (res.spectrogram) drawSpectrogramOn('filtSpecNew', res.spectrogram);
+  }, 50);
+}
+
+function drawMiniWaveFromData(canvasId, data) {
+  const c = document.getElementById(canvasId);
+  if (!c || !data) return;
+  const ctx = c.getContext('2d');
+  c.width = c.offsetWidth * 2;
+  c.height = c.offsetHeight * 2;
+  ctx.clearRect(0, 0, c.width, c.height);
+  const samples = data.samples;
+  if (!samples || !samples.length) return;
+  const maxVal = Math.max(...samples.map(Math.abs), 1);
+  ctx.strokeStyle = canvasId.includes('Orig') ? '#3b82f6' : '#22c55e';
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  const step = c.width / samples.length;
+  for (let i = 0; i < samples.length; i++) {
+    const x = i * step;
+    const y = c.height / 2 - (samples[i] / maxVal) * (c.height / 2 - 5);
+    i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+  }
+  ctx.stroke();
+}
+
+function drawSpectrogramOn(canvasId, spec) {
+  const canvas = document.getElementById(canvasId);
+  if (!canvas) return;
+  const ctx = canvas.getContext('2d');
+  canvas.width = canvas.offsetWidth * 2;
+  canvas.height = canvas.offsetHeight * 2;
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  if (!spec || !spec.power_db || !spec.power_db.length) return;
+  const rows = spec.power_db.length;
+  const cols = spec.power_db[0].length;
+  const allVals = spec.power_db.flat();
+  const vmin = Math.min(...allVals);
+  const vmax = Math.max(...allVals);
+  const range = vmax - vmin || 1;
+  for (let r = 0; r < rows; r++) {
+    const y = (r / rows) * canvas.height;
+    const h = canvas.height / rows + 1;
+    for (let c = 0; c < cols; c++) {
+      const x = (c / cols) * canvas.width;
+      const w = canvas.width / cols + 1;
+      const val = (spec.power_db[r][c] - vmin) / range;
+      const hue = (1 - val) * 240;
+      ctx.fillStyle = `hsl(${hue},90%,${val * 50 + 10}%)`;
+      ctx.fillRect(x, y, w, h);
+    }
+  }
 }
 
 loadRecordings();

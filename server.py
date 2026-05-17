@@ -284,30 +284,160 @@ async def api_recording_audio(rec_id: str):
     return FileResponse(str(path), media_type="audio/wav", filename=rec_id)
 
 
-@app.get("/api/recordings/{rec_id}/waveform")
-async def api_recording_waveform(rec_id: str):
-    path = RECORDINGS_DIR / rec_id
-    if not path.exists():
-        raise HTTPException(404)
-    with wave.open(str(path), "rb") as wf:
-        frames = wf.readframes(wf.getnframes())
-        samples = np.frombuffer(frames, dtype=np.int16)
-    downsample = max(1, len(samples) // 2000)
-    down = samples[::downsample]
-    return JSONResponse({
-        "samples": down.tolist(),
-        "total_samples": len(samples),
-        "downsample": downsample,
-    })
-
-
-@app.get("/api/recordings/{rec_id}/metrics")
-async def api_recording_metrics(rec_id: str):
+def load_pcm(rec_id: str) -> np.ndarray:
     path = RECORDINGS_DIR / rec_id
     if not path.exists():
         raise HTTPException(404)
     with wave.open(str(path), "rb") as wf:
         raw = wf.readframes(wf.getnframes())
+    return np.frombuffer(raw, dtype=np.int16).astype(np.float64)
+
+
+def pcm_to_bytes(samples: np.ndarray) -> bytes:
+    clipped = np.clip(samples, -32768, 32767).astype(np.int16)
+    return clipped.tobytes()
+
+
+def samples_to_waveform(samples: np.ndarray) -> dict:
+    downsample = max(1, len(samples) // 2000)
+    down = samples[::downsample]
+    return {
+        "samples": down.tolist(),
+        "total_samples": len(samples),
+        "downsample": downsample,
+    }
+
+
+def apply_highpass(samples: np.ndarray, cutoff: float, fs: int = 16000) -> np.ndarray:
+    from scipy.signal import butter, sosfilt
+    sos = butter(4, cutoff, btype="high", fs=fs, output="sos")
+    return sosfilt(sos, samples)
+
+
+def apply_lowpass(samples: np.ndarray, cutoff: float, fs: int = 16000) -> np.ndarray:
+    from scipy.signal import butter, sosfilt
+    sos = butter(4, cutoff, btype="low", fs=fs, output="sos")
+    return sosfilt(sos, samples)
+
+
+def apply_noise_gate(samples: np.ndarray, threshold_db: float = -40) -> np.ndarray:
+    rms = np.sqrt(np.mean(samples ** 2))
+    if rms == 0:
+        return samples
+    threshold = 32768 * (10 ** (threshold_db / 20))
+    env = np.abs(samples)
+    win = int(16000 * 0.01)
+    if win < 2:
+        return samples
+    kernel = np.ones(win) / win
+    env_smooth = np.convolve(env, kernel, mode="same")
+    mask = env_smooth > threshold
+    return samples * mask
+
+
+def apply_spectral_subtraction(samples: np.ndarray, noise_frames: int = 5, fs: int = 16000) -> np.ndarray:
+    from scipy.signal import stft, istft
+    nperseg = 256
+    f, t, Zxx = stft(samples, fs=fs, nperseg=nperseg)
+    noise_profile = np.mean(np.abs(Zxx[:, :min(noise_frames, Zxx.shape[1])]), axis=1, keepdims=True)
+    mag = np.abs(Zxx)
+    phase = np.angle(Zxx)
+    mag_clean = np.maximum(mag - noise_profile * 1.5, 0)
+    Zxx_clean = mag_clean * np.exp(1j * phase)
+    _, reconstructed = istft(Zxx_clean, fs=fs, nperseg=nperseg)
+    return reconstructed[:len(samples)]
+
+
+def apply_normalize(samples: np.ndarray, target_db: float = -3) -> np.ndarray:
+    peak = np.max(np.abs(samples))
+    if peak == 0:
+        return samples
+    target = 32768 * (10 ** (target_db / 20))
+    gain = target / peak
+    return samples * gain
+
+
+def apply_agc(samples: np.ndarray, frame_ms: float = 20, target_rms_db: float = -20, fs: int = 16000) -> np.ndarray:
+    frame_len = int(fs * frame_ms / 1000)
+    target_rms = 32768 * (10 ** (target_rms_db / 20))
+    out = np.copy(samples)
+    n_frames = max(1, len(samples) // frame_len)
+    for i in range(n_frames):
+        s = i * frame_len
+        e = min(s + frame_len, len(samples))
+        frame = samples[s:e]
+        rms = np.sqrt(np.mean(frame ** 2))
+        if rms > 100:
+            gain = min(target_rms / rms, 10.0)
+            out[s:e] = frame * gain
+    return out
+
+
+FILTERS = {
+    "highpass_150": lambda s: apply_highpass(s, 150),
+    "highpass_300": lambda s: apply_highpass(s, 300),
+    "lowpass_4000": lambda s: apply_lowpass(s, 4000),
+    "noise_gate": lambda s: apply_noise_gate(s, -40),
+    "spectral_subtraction": lambda s: apply_spectral_subtraction(s),
+    "normalize": lambda s: apply_normalize(s, -3),
+    "agc": lambda s: apply_agc(s),
+}
+
+
+@app.post("/api/recordings/{rec_id}/filter")
+async def api_filter(rec_id: str, body: dict = None):
+    body = body or {}
+    filter_names = body.get("filters", [])
+    chain = body.get("chain", None)
+
+    samples = load_pcm(rec_id)
+
+    if chain:
+        for step in chain:
+            fname = step.get("filter")
+            if fname not in FILTERS:
+                raise HTTPException(400, f"Unknown filter: {fname}")
+            samples = FILTERS[fname](samples)
+    else:
+        for fname in filter_names:
+            if fname not in FILTERS:
+                raise HTTPException(400, f"Unknown filter: {fname}")
+            samples = FILTERS[fname](samples)
+
+    raw = pcm_to_bytes(samples)
+    metrics = compute_metrics(raw)
+    waveform = samples_to_waveform(samples)
+    spectrogram = compute_spectrogram(raw)
+    return JSONResponse({
+        "metrics": metrics,
+        "waveform": waveform,
+        "spectrogram": spectrogram,
+    })
+
+
+@app.get("/api/filters")
+async def api_list_filters():
+    return JSONResponse([
+        {"id": "highpass_150", "name": "High-pass 150Hz", "desc": "Убирает низкочастотный гул"},
+        {"id": "highpass_300", "name": "High-pass 300Hz", "desc": "Агрессивнее, убирает басы"},
+        {"id": "lowpass_4000", "name": "Low-pass 4kHz", "desc": "Оставляет только голос (0-4kHz)"},
+        {"id": "noise_gate", "name": "Noise Gate -40dB", "desc": "Обрезает тихие участки"},
+        {"id": "spectral_subtraction", "name": "Spectral Subtraction", "desc": "Вычитает шум по спектру"},
+        {"id": "normalize", "name": "Normalize -3dB", "desc": "Нормализация громкости"},
+        {"id": "agc", "name": "AGC", "desc": "Автоматическая регулировка усиления"},
+    ])
+
+
+@app.get("/api/recordings/{rec_id}/waveform")
+async def api_recording_waveform(rec_id: str):
+    samples = load_pcm(rec_id)
+    return JSONResponse(samples_to_waveform(samples))
+
+
+@app.get("/api/recordings/{rec_id}/metrics")
+async def api_recording_metrics(rec_id: str):
+    samples = load_pcm(rec_id)
+    raw = pcm_to_bytes(samples)
     metrics = compute_metrics(raw)
     metrics["filename"] = rec_id
     return JSONResponse(metrics)
@@ -315,11 +445,8 @@ async def api_recording_metrics(rec_id: str):
 
 @app.get("/api/recordings/{rec_id}/spectrogram")
 async def api_recording_spectrogram(rec_id: str):
-    path = RECORDINGS_DIR / rec_id
-    if not path.exists():
-        raise HTTPException(404)
-    with wave.open(str(path), "rb") as wf:
-        raw = wf.readframes(wf.getnframes())
+    samples = load_pcm(rec_id)
+    raw = pcm_to_bytes(samples)
     spec = compute_spectrogram(raw)
     return JSONResponse(spec or {"error": "too short"})
 
