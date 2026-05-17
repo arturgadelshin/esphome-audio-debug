@@ -327,7 +327,7 @@ async def api_asr(body: dict):
 
 
 async def transcribe_wyoming(wav_bytes: bytes) -> str:
-    from wyoming.client import AsyncClient
+    from wyoming.client import AsyncTcpClient
     from wyoming.asr import Transcribe, Transcript
     from wyoming.audio import AudioStart, AudioStop, AudioChunk, wav_to_chunks
 
@@ -335,7 +335,7 @@ async def transcribe_wyoming(wav_bytes: bytes) -> str:
     port = CONFIG["asr_port"]
     log.info("ASR connecting to %s:%s", host, port)
 
-    async with AsyncClient(host, port) as client:
+    async with AsyncTcpClient(host, port) as client:
         await client.write_event(Transcribe().event())
         with io.BytesIO(wav_bytes) as wav_buf:
             chunks = list(wav_to_chunks(wav_buf, chunk_seconds=2.0))
