@@ -27,7 +27,7 @@ CONFIG_FILE = Path(__file__).parent / "config.json"
 DEFAULT_CONFIG = {
     "device_host": "192.168.1.48",
     "device_port": 6053,
-    "asr_host": "192.168.1.124",
+    "asr_host": "localhost",
     "asr_port": 10306,
     "filter_defaults": {
         "normalize": {"target_db": -10},
