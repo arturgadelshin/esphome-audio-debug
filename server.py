@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import io
 import json
 import logging
@@ -408,10 +409,12 @@ async def api_filter(rec_id: str, body: dict = None):
     metrics = compute_metrics(raw)
     waveform = samples_to_waveform(samples)
     spectrogram = compute_spectrogram(raw)
+    wav_b64 = base64.b64encode(save_wav(raw)).decode("ascii")
     return JSONResponse({
         "metrics": metrics,
         "waveform": waveform,
         "spectrogram": spectrogram,
+        "audio_b64": wav_b64,
     })
 
 

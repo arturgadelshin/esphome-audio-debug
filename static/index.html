@@ -499,12 +499,14 @@ function drawMiniWave(canvasId, samples) {
 }
 
 let origMetrics = null;
+let lastFilteredAudio = null;
 
 async function applyFilter(filterName) {
   if (!selected) { alert('Select a recording first'); return; }
   document.getElementById('filterStatus').textContent = 'Processing...';
   try {
     const res = await api('POST', `/api/recordings/${selected}/filter`, { filters: [filterName] });
+    lastFilteredAudio = res.audio_b64;
     showFilterResult(filterName, res);
   } catch(e) { document.getElementById('filterStatus').textContent = 'Error: ' + e; }
 }
@@ -517,8 +519,18 @@ async function applyChain() {
   document.getElementById('filterStatus').textContent = 'Processing chain...';
   try {
     const res = await api('POST', `/api/recordings/${selected}/filter`, { filters });
+    lastFilteredAudio = res.audio_b64;
     showFilterResult(filters.join(' → '), res);
   } catch(e) { document.getElementById('filterStatus').textContent = 'Error: ' + e; }
+}
+
+function playFiltered() {
+  if (!lastFilteredAudio) return;
+  const binary = atob(lastFilteredAudio);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  const blob = new Blob([bytes], { type: 'audio/wav' });
+  new Audio(URL.createObjectURL(blob)).play();
 }
 
 function showFilterResult(label, res) {
@@ -543,7 +555,7 @@ function showFilterResult(label, res) {
       </div>
     </div>
     <div class="compare-item">
-      <h4>Filtered: ${label}</h4>
+      <h4>Filtered: ${label} <button class="btn-success" style="padding:2px 8px;font-size:11px;margin-left:8px" onclick="playFiltered()">Play</button></h4>
       <canvas id="filtWaveNew"></canvas>
       <canvas id="filtSpecNew" style="height:150px;margin-top:8px"></canvas>
       <div class="filter-metrics">
