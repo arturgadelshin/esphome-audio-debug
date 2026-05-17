@@ -31,6 +31,7 @@ button:disabled{opacity:.4;cursor:not-allowed}
 .btn-success:hover:not(:disabled){background:#16a34a}
 .btn-ghost{background:transparent;color:#94a3b8;border:1px solid #475569}
 .btn-ghost:hover{background:#334155}
+.btn-active{background:#3b82f6!important;color:#fff!important;border-color:#3b82f6!important}
 .toggle{display:flex;align-items:center;gap:8px;font-size:13px;color:#94a3b8}
 .toggle input{width:16px;height:16px;accent-color:#3b82f6}
 .rec-list{display:flex;flex-direction:column;gap:8px;max-height:500px;overflow-y:auto}
@@ -138,18 +139,21 @@ canvas{width:100%;height:200px;border-radius:8px;background:#0f172a;cursor:cross
     <div id="filterParamsPanel" style="margin-bottom:12px;display:none;background:#0f172a;border-radius:8px;padding:12px;border:1px solid #334155">
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
         <span style="color:#38bdf8;font-weight:600" id="paramFilterName"></span>
-        <button class="btn-primary" style="padding:6px 16px;font-size:13px" onclick="applySelectedFilter()">Apply</button>
+        <div style="display:flex;gap:6px">
+          <button class="btn-success" style="padding:6px 16px;font-size:13px" onclick="confirmFilter()">OK</button>
+        </div>
       </div>
       <div id="paramInputs" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px"></div>
     </div>
     <div style="margin-bottom:12px;display:flex;gap:8px;align-items:center;font-size:13px;color:#64748b">
       <span>Chain:</span>
-      <input id="filterChainInput" type="text" value="highpass:cutoff=150,spectral_subtraction:noise_frames=5,normalize:target_db=-6" style="flex:1;padding:6px 10px;background:#0f172a;border:1px solid #334155;border-radius:6px;color:#e2e8f0;font-size:13px">
+      <input id="filterChainInput" type="text" value="" placeholder="click filters above to build chain" style="flex:1;padding:6px 10px;background:#0f172a;border:1px solid #334155;border-radius:6px;color:#e2e8f0;font-size:13px">
       <button class="btn-primary" style="padding:6px 16px;font-size:13px" onclick="applyChain()">Apply Chain</button>
+      <button class="btn-ghost" style="padding:6px 16px;font-size:13px" onclick="clearChain()">Clear</button>
       <span id="filterStatus"></span>
     </div>
     <div class="compare-container" id="filterCompare">
-      <div class="empty">Select a recording and click a filter to compare</div>
+      <div class="empty">Select a recording and click filters to build chain, then Apply Chain</div>
     </div>
   </div>
 
@@ -504,14 +508,111 @@ function drawMiniWave(canvasId, samples) {
 let origMetrics = null;
 let lastFilteredAudio = null;
 let filterDefs = [];
+let activeChain = [];
 let selectedFilterId = null;
 
 async function loadFilters() {
   filterDefs = await api('GET', '/api/filters');
+  renderFilterButtons();
+}
+
+function renderFilterButtons() {
   const el = document.getElementById('filterButtons');
-  el.innerHTML = '<div class="controls">' + filterDefs.map(f =>
-    `<button class="btn-ghost" onclick="selectFilter('${f.id}')" title="${f.desc}">${f.name}</button>`
-  ).join('') + '</div>';
+  el.innerHTML = '<div class="controls" id="filterBtnRow">' + filterDefs.map(f => {
+    const active = activeChain.some(c => c.filter === f.id);
+    return `<button class="${active ? 'btn-active' : 'btn-ghost'}" data-filter="${f.id}" onclick="toggleFilter('${f.id}')" title="${f.desc}">${f.name}</button>`;
+  }).join('') + '</div>';
+}
+
+function toggleFilter(id) {
+  const idx = activeChain.findIndex(c => c.filter === id);
+  if (idx >= 0) {
+    activeChain.splice(idx, 1);
+  } else {
+    const f = filterDefs.find(x => x.id === id);
+    const params = {};
+    for (const [k, p] of Object.entries(f.params)) params[k] = p.default;
+    activeChain.push({"filter": id, "params": params});
+    showFilterParams(id);
+  }
+  renderFilterButtons();
+  updateChainInput();
+}
+
+function showFilterParams(id) {
+  selectedFilterId = id;
+  const f = filterDefs.find(x => x.id === id);
+  if (!f) return;
+  document.getElementById('paramFilterName').textContent = f.name + ' — ' + f.desc;
+  document.getElementById('filterParamsPanel').style.display = 'block';
+  const existing = activeChain.find(c => c.filter === id);
+  const inputs = document.getElementById('paramInputs');
+  inputs.innerHTML = Object.entries(f.params).map(([key, p]) => {
+    const val = existing && existing.params[key] !== undefined ? existing.params[key] : p.default;
+    return `<div><label style="font-size:11px;color:#64748b;display:block;margin-bottom:2px">${p.label} (${key})</label>` +
+    `<input id="param_${key}" type="number" value="${val}" min="${p.min}" max="${p.max}" step="${p.type==='float'?'0.1':'1'}" ` +
+    `style="width:100%;padding:6px 8px;background:#1e293b;border:1px solid #334155;border-radius:4px;color:#e2e8f0;font-size:13px"></div>`;
+  }).join('');
+}
+
+function confirmFilter() {
+  if (!selectedFilterId) return;
+  const entry = activeChain.find(c => c.filter === selectedFilterId);
+  if (!entry) return;
+  const f = filterDefs.find(x => x.id === selectedFilterId);
+  for (const [key, p] of Object.entries(f.params)) {
+    const el = document.getElementById('param_' + key);
+    if (el) entry.params[key] = parseFloat(el.value);
+  }
+  updateChainInput();
+  document.getElementById('filterParamsPanel').style.display = 'none';
+}
+
+function updateChainInput() {
+  document.getElementById('filterChainInput').value = activeChain.map(c => {
+    const ps = Object.entries(c.params).map(([k,v]) => k + '=' + v).join(':');
+    return ps ? c.filter + ':' + ps : c.filter;
+  }).join(', ');
+}
+
+function clearChain() {
+  activeChain = [];
+  selectedFilterId = null;
+  renderFilterButtons();
+  updateChainInput();
+  document.getElementById('filterParamsPanel').style.display = 'none';
+}
+
+async function applyChain() {
+  if (!selected) { alert('Select a recording first'); return; }
+  const chainStr = document.getElementById('filterChainInput').value.trim();
+  if (!chainStr && !activeChain.length) return;
+  let chain = activeChain.length ? activeChain : parseChain(chainStr);
+  if (!chain.length) return;
+  document.getElementById('filterStatus').textContent = 'Processing...';
+  try {
+    const res = await api('POST', `/api/recordings/${selected}/filter`, { chain });
+    lastFilteredAudio = res.audio_b64;
+    const label = chain.map(c => c.filter + '(' + Object.entries(c.params).map(([k,v])=>k+'='+v).join(', ') + ')').join(' → ');
+    showFilterResult(label, res);
+  } catch(e) { document.getElementById('filterStatus').textContent = 'Error: ' + (e.message||e); }
+}
+
+function parseChain(str) {
+  return str.split(',').map(s => {
+    s = s.trim();
+    if (!s) return null;
+    const parts = s.split(':');
+    const fname = parts[0];
+    const params = {};
+    const f = filterDefs.find(x => x.id === fname);
+    if (f) for (const [k, p] of Object.entries(f.params)) params[k] = p.default;
+    parts.slice(1).forEach(p => {
+      const [k, v] = p.split('=');
+      if (k && v !== undefined) params[k.trim()] = parseFloat(v);
+    });
+    return {"filter": fname, "params": params};
+  }).filter(Boolean);
 }
 
 function selectFilter(id) {
