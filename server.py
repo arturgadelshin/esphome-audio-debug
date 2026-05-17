@@ -338,12 +338,16 @@ async def transcribe_wyoming(wav_bytes: bytes) -> str:
     async with AsyncTcpClient(host, port) as client:
         await client.write_event(Transcribe().event())
         with io.BytesIO(wav_bytes) as wav_buf:
-            chunks = list(wav_to_chunks(wav_buf, chunk_seconds=2.0))
+            with wave.open(wav_buf, "rb") as wf:
+                rate = wf.getframerate()
+                width = wf.getsampwidth()
+                channels = wf.getnchannels()
+                samples_per_chunk = rate * 2
+                chunks = list(wav_to_chunks(wf, samples_per_chunk))
 
         if chunks:
-            first = chunks[0]
             await client.write_event(AudioStart(
-                rate=first.rate, width=first.width, channels=first.channels
+                rate=rate, width=width, channels=channels
             ).event())
             for chunk in chunks:
                 await client.write_event(chunk.event())
