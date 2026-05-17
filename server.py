@@ -22,6 +22,35 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 
 RECORDINGS_DIR = Path(__file__).parent / "recordings"
 RECORDINGS_DIR.mkdir(exist_ok=True)
+CONFIG_FILE = Path(__file__).parent / "config.json"
+
+DEFAULT_CONFIG = {
+    "device_host": "192.168.1.48",
+    "device_port": 6053,
+    "asr_host": "192.168.1.124",
+    "asr_port": 10306,
+    "filter_defaults": {
+        "normalize": {"target_db": -10},
+        "spectral_subtraction": {"noise_frames": 40},
+    },
+}
+
+
+def load_config() -> dict:
+    if CONFIG_FILE.exists():
+        cfg = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        for k, v in DEFAULT_CONFIG.items():
+            if k not in cfg:
+                cfg[k] = v
+        return cfg
+    return dict(DEFAULT_CONFIG)
+
+
+def save_config(cfg: dict):
+    CONFIG_FILE.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+CONFIG = load_config()
 
 app = FastAPI()
 
@@ -214,7 +243,7 @@ async def index():
 @app.post("/api/connect")
 async def api_connect():
     try:
-        info = await connect_device("192.168.1.48", 6053, None)
+        info = await connect_device(CONFIG["device_host"], CONFIG["device_port"], None)
         return JSONResponse(info)
     except Exception as e:
         STATE["connected"] = False
@@ -253,6 +282,81 @@ async def api_status():
 async def api_auto_capture(enabled: bool):
     STATE["auto_capture"] = enabled
     return JSONResponse({"auto_capture": STATE["auto_capture"]})
+
+
+@app.get("/api/config")
+async def api_get_config():
+    return JSONResponse(CONFIG)
+
+
+@app.post("/api/config")
+async def api_set_config(body: dict):
+    global CONFIG
+    for key in ("device_host", "device_port", "asr_host", "asr_port"):
+        if key in body:
+            CONFIG[key] = body[key]
+    if "filter_defaults" in body:
+        CONFIG["filter_defaults"].update(body["filter_defaults"])
+        FILTER_DEFAULTS.update(body["filter_defaults"])
+    save_config(CONFIG)
+    return JSONResponse(CONFIG)
+
+
+@app.post("/api/asr")
+async def api_asr(body: dict):
+    audio_b64 = body.get("audio_b64")
+    rec_id = body.get("rec_id")
+    filters = body.get("filters")
+
+    if audio_b64:
+        wav_bytes = base64.b64decode(audio_b64)
+    elif rec_id:
+        samples = load_pcm(rec_id)
+        if filters:
+            samples = apply_filter_chain(samples, filters)
+        wav_bytes = save_wav(pcm_to_bytes(samples))
+    else:
+        raise HTTPException(400, "Provide audio_b64 or rec_id")
+
+    try:
+        text = await transcribe_wyoming(wav_bytes)
+        return JSONResponse({"text": text})
+    except Exception as e:
+        log.error("ASR error: %s", e)
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+async def transcribe_wyoming(wav_bytes: bytes) -> str:
+    from wyoming.client import AsyncClient
+    from wyoming.asr import Transcribe, Transcript
+    from wyoming.audio import AudioStart, AudioStop, AudioChunk, wav_to_chunks
+
+    host = CONFIG["asr_host"]
+    port = CONFIG["asr_port"]
+    log.info("ASR connecting to %s:%s", host, port)
+
+    async with AsyncClient(host, port) as client:
+        await client.write_event(Transcribe().event())
+        with io.BytesIO(wav_bytes) as wav_buf:
+            chunks = list(wav_to_chunks(wav_buf, chunk_seconds=2.0))
+
+        if chunks:
+            first = chunks[0]
+            await client.write_event(AudioStart(
+                rate=first.rate, width=first.width, channels=first.channels
+            ).event())
+            for chunk in chunks:
+                await client.write_event(chunk.event())
+            await client.write_event(AudioStop().event())
+
+        while True:
+            event = await client.read_event()
+            if event is None:
+                break
+            if Transcript.is_type(event.type):
+                transcript = Transcript.from_event(event)
+                return transcript.text
+    return ""
 
 
 @app.get("/api/recordings")
@@ -415,12 +519,14 @@ FILTER_DEFAULTS = {
     "highpass": {"cutoff": 150},
     "lowpass": {"cutoff": 4000},
     "noise_gate": {"threshold_db": -40},
-    "spectral_subtraction": {"noise_frames": 5},
-    "normalize": {"target_db": -6},
+    "spectral_subtraction": {"noise_frames": 40},
+    "normalize": {"target_db": -10},
     "limiter": {"ceiling_db": -1},
     "compressor": {"threshold_db": -20, "ratio": 4.0},
     "agc": {"frame_ms": 20, "target_rms_db": -20},
 }
+
+FILTER_DEFAULTS.update(CONFIG.get("filter_defaults", {}))
 
 
 def apply_filter_chain(samples: np.ndarray, steps: list) -> np.ndarray:

@@ -92,7 +92,24 @@ canvas{width:100%;height:200px;border-radius:8px;background:#0f172a;cursor:cross
       <button class="btn-ghost" id="btnRefresh" onclick="loadRecordings()">Refresh List</button>
       <div class="toggle">
         <input type="checkbox" id="chkAuto" checked onchange="toggleAuto(this.checked)">
-        <label for="chkAuto">Auto-capture on wake word</label>
+        <label for="chkAuto">Auto-capture</label>
+      </div>
+      <button class="btn-ghost" onclick="toggleSettings()">Settings</button>
+    </div>
+    <div id="settingsPanel" style="display:none;margin-top:12px;background:#0f172a;border-radius:8px;padding:12px;border:1px solid #334155">
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px">
+        <div><label style="font-size:11px;color:#64748b">ESP32 IP</label>
+          <input id="cfgDeviceHost" style="width:100%;padding:6px 8px;background:#1e293b;border:1px solid #334155;border-radius:4px;color:#e2e8f0;font-size:13px"></div>
+        <div><label style="font-size:11px;color:#64748b">ESP32 Port</label>
+          <input id="cfgDevicePort" type="number" style="width:100%;padding:6px 8px;background:#1e293b;border:1px solid #334155;border-radius:4px;color:#e2e8f0;font-size:13px"></div>
+        <div><label style="font-size:11px;color:#64748b">ASR Host (Wyoming)</label>
+          <input id="cfgAsrHost" style="width:100%;padding:6px 8px;background:#1e293b;border:1px solid #334155;border-radius:4px;color:#e2e8f0;font-size:13px"></div>
+        <div><label style="font-size:11px;color:#64748b">ASR Port</label>
+          <input id="cfgAsrPort" type="number" style="width:100%;padding:6px 8px;background:#1e293b;border:1px solid #334155;border-radius:4px;color:#e2e8f0;font-size:13px"></div>
+      </div>
+      <div style="margin-top:8px;display:flex;gap:8px;align-items:center">
+        <button class="btn-success" style="padding:6px 16px;font-size:12px" onclick="saveSettings()">Save as Default</button>
+        <span id="settingsStatus" style="font-size:12px;color:#64748b"></span>
       </div>
     </div>
     <div class="capture-info" id="captureInfo">Connect to device and say wake word to capture audio</div>
@@ -106,11 +123,23 @@ canvas{width:100%;height:200px;border-radius:8px;background:#0f172a;cursor:cross
     </div>
   </div>
 
-  <!-- Metrics -->
+  <!-- Metrics + ASR -->
   <div class="panel">
     <h2>Metrics</h2>
     <div class="metrics-grid" id="metricsGrid">
       <div class="empty">Select a recording</div>
+    </div>
+    <div style="margin-top:12px;display:flex;gap:6px">
+      <button class="btn-primary" style="padding:6px 12px;font-size:12px" id="btnPlayOrig" onclick="playAudio(selected)" disabled>Play Original</button>
+      <button class="btn-success" style="padding:6px 12px;font-size:12px" id="btnAsrOrig" onclick="doASR('original')" disabled>ASR Original</button>
+    </div>
+  </div>
+
+  <!-- ASR Result -->
+  <div class="panel">
+    <h2>ASR (Speech-to-Text)</h2>
+    <div id="asrResult" style="background:#0f172a;border-radius:8px;padding:16px;min-height:80px;border:1px solid #334155">
+      <div class="empty" style="padding:10px">Click ASR to recognize speech</div>
     </div>
   </div>
 
@@ -294,6 +323,8 @@ async function selectRecording(id, evt) {
   document.getElementById('waveTitle').textContent = id;
   document.getElementById('specTitle').textContent = id + ' (loading...)';
   document.getElementById('filterRecTitle').textContent = id;
+  document.getElementById('btnPlayOrig').disabled = false;
+  document.getElementById('btnAsrOrig').disabled = false;
   drawWaveform(id);
   loadSpectrogram(id);
 }
@@ -510,6 +541,54 @@ let lastFilteredAudio = null;
 let filterDefs = [];
 let activeChain = [];
 let selectedFilterId = null;
+let appConfig = {};
+
+function toggleSettings() {
+  const p = document.getElementById('settingsPanel');
+  p.style.display = p.style.display === 'none' ? 'block' : 'none';
+}
+
+async function loadConfig() {
+  appConfig = await api('GET', '/api/config');
+  document.getElementById('cfgDeviceHost').value = appConfig.device_host;
+  document.getElementById('cfgDevicePort').value = appConfig.device_port;
+  document.getElementById('cfgAsrHost').value = appConfig.asr_host;
+  document.getElementById('cfgAsrPort').value = appConfig.asr_port;
+}
+
+async function saveSettings() {
+  const cfg = {
+    device_host: document.getElementById('cfgDeviceHost').value,
+    device_port: parseInt(document.getElementById('cfgDevicePort').value),
+    asr_host: document.getElementById('cfgAsrHost').value,
+    asr_port: parseInt(document.getElementById('cfgAsrPort').value),
+  };
+  await api('POST', '/api/config', cfg);
+  document.getElementById('settingsStatus').textContent = 'Saved!';
+  setTimeout(() => document.getElementById('settingsStatus').textContent = '', 2000);
+}
+
+async function doASR(type) {
+  if (!selected) return;
+  const resultEl = document.getElementById('asrResult');
+  resultEl.innerHTML = '<div style="color:#f59e0b;padding:10px">Recognizing...</div>';
+  try {
+    let res;
+    if (type === 'original') {
+      res = await api('POST', '/api/asr', { rec_id: selected });
+    } else {
+      if (!lastFilteredAudio) { resultEl.innerHTML = '<div style="color:#ef4444;padding:10px">Apply filters first</div>'; return; }
+      res = await api('POST', '/api/asr', { audio_b64: lastFilteredAudio });
+    }
+    if (res.error) {
+      resultEl.innerHTML = `<div style="color:#ef4444;padding:10px">Error: ${res.error}</div>`;
+    } else {
+      resultEl.innerHTML = `<div style="padding:10px"><span style="font-size:11px;color:#64748b;text-transform:uppercase">${type === 'original' ? 'Original' : 'Filtered'}</span><div style="font-size:16px;color:#e2e8f0;margin-top:4px">"${res.text}"</div></div>`;
+    }
+  } catch(e) {
+    resultEl.innerHTML = `<div style="color:#ef4444;padding:10px">Error: ${e.message}</div>`;
+  }
+}
 
 async function loadFilters() {
   filterDefs = await api('GET', '/api/filters');
@@ -716,7 +795,7 @@ function showFilterResult(label, res) {
       </div>
     </div>
     <div class="compare-item">
-      <h4>Filtered: ${label} <button class="btn-success" style="padding:2px 8px;font-size:11px;margin-left:8px" onclick="playFiltered()">Play</button></h4>
+      <h4>Filtered: ${label} <button class="btn-success" style="padding:2px 8px;font-size:11px;margin-left:8px" onclick="playFiltered()">Play</button> <button class="btn-primary" style="padding:2px 8px;font-size:11px" onclick="doASR('filtered')">ASR</button></h4>
       <canvas id="filtWaveNew"></canvas>
       <canvas id="filtSpecNew" style="height:150px;margin-top:8px"></canvas>
       <div class="filter-metrics">
@@ -784,6 +863,7 @@ function drawSpectrogramOn(canvasId, spec) {
   }
 }
 
+loadConfig();
 loadFilters();
 loadRecordings();
 </script>
